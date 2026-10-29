@@ -1,16 +1,17 @@
+import time
 from datetime import timedelta
 
 from django.db import transaction
 from django.db.models import F, Sum, Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, authentication_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import User, Question, Announcement, GameResult
+from .models import User, Question, Announcement, GameResult, SyncSection
 from .serializers import (
     UserSerializer, RegisterSerializer, MeUpdateSerializer,
     QuestionPublicSerializer, AnswerSerializer, ResultSerializer,
@@ -283,3 +284,111 @@ class AnnouncementListView(APIView):
     def get(self, request):
         items = Announcement.objects.all()[:5]
         return Response(AnnouncementSerializer(items, many=True).data)
+
+
+# ================= SINXRONIZATSIYA (server.ts ning o'rniga) =================
+# Frontend /api/data, /api/rooms ... ga so'rov yuboradi, ma'lumot Neon bazasida saqlanadi.
+
+SYNC_META = "_meta"
+SYNC_SECTIONS = [
+    "settings", "questions", "schedule", "teachers", "library", "promos",
+    "announcements", "homework", "quests", "users", "teacher_accounts",
+    "board_rooms",
+]
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def _read_db():
+    db = {}
+    for row in SyncSection.objects.all():
+        if row.key == SYNC_META:
+            db["version"] = row.data.get("version", 1)
+            db["lastUpdated"] = row.data.get("lastUpdated", _now_ms())
+        else:
+            db[row.key] = row.data
+    db.setdefault("version", 1)
+    db.setdefault("lastUpdated", _now_ms())
+    return db
+
+
+def _bump():
+    """Faqat transaction.atomic() ichida chaqiring."""
+    meta, _ = SyncSection.objects.select_for_update().get_or_create(
+        key=SYNC_META, defaults={"data": {"version": 1, "lastUpdated": _now_ms()}}
+    )
+    meta.data = {"version": meta.data.get("version", 1) + 1, "lastUpdated": _now_ms()}
+    meta.save()
+    return meta.data
+
+
+@api_view(["GET"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def sync_version(request):
+    db = _read_db()
+    return Response({"version": db["version"], "lastUpdated": db["lastUpdated"]})
+
+
+@api_view(["GET"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def sync_data(request):
+    return Response(_read_db())
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def sync_update(request):
+    section = request.data.get("section")
+    if section not in SYNC_SECTIONS:
+        return Response({"error": "Invalid section"}, status=400)
+    data = request.data.get("data")
+    if data is None:
+        data = []
+    with transaction.atomic():
+        SyncSection.objects.update_or_create(key=section, defaults={"data": data})
+        meta = _bump()
+    return Response({"success": True, "section": section, **meta})
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def sync_initial(request):
+    payload = request.data if isinstance(request.data, dict) else {}
+    with transaction.atomic():
+        existing = {r.key: r.data for r in SyncSection.objects.all()}
+        modified = False
+        for s in SYNC_SECTIONS:
+            if not existing.get(s) and payload.get(s):
+                SyncSection.objects.update_or_create(key=s, defaults={"data": payload[s]})
+                modified = True
+        if modified:
+            _bump()
+    db = _read_db()
+    return Response({"success": True, "version": db["version"], "data": db})
+
+
+@api_view(["GET"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def rooms_get(request):
+    row = SyncSection.objects.filter(key="rooms").first()
+    return Response({"rooms": row.data if row else []})
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def rooms_sync(request):
+    rooms = request.data.get("rooms")
+    if not isinstance(rooms, list):
+        return Response({"error": "Rooms must be array"}, status=400)
+    with transaction.atomic():
+        SyncSection.objects.update_or_create(key="rooms", defaults={"data": rooms})
+        _bump()
+    return Response({"success": True, "count": len(rooms)})
