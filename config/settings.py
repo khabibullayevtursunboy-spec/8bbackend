@@ -16,7 +16,7 @@ def env_list(name, default=""):
 # ---------- Asosiy ----------
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-only-insecure-key")
 DEBUG = os.getenv("DEBUG", "False") == "True"
-ALLOWED_HOSTS = env_list("ALLOWED_HOSTS", "127.0.0.1,localhost")
+ALLOWED_HOSTS = ["localhost", "127.0.0.1", "school-backend-lecj.onrender.com"]
 
 if not DEBUG and SECRET_KEY == "dev-only-insecure-key":
     raise RuntimeError("Productionda SECRET_KEY ni .env / hosting sozlamasiga yozing!")
