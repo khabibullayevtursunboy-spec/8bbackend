@@ -13,10 +13,24 @@ def env_list(name, default=""):
     return [v.strip() for v in os.getenv(name, default).split(",") if v.strip()]
 
 
+def merge(*lists):
+    """Ro'yxatlarni birlashtiradi, takrorlarni olib tashlaydi (tartib saqlanadi)."""
+    out = []
+    for lst in lists:
+        for item in lst:
+            if item not in out:
+                out.append(item)
+    return out
+
+
 # ---------- Asosiy ----------
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-only-insecure-key")
 DEBUG = os.getenv("DEBUG", "False") == "True"
+
 ALLOWED_HOSTS = ["localhost", "127.0.0.1", "school-backend-lecj.onrender.com"]
+_render_host = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+if _render_host and _render_host not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(_render_host)
 
 if not DEBUG and SECRET_KEY == "dev-only-insecure-key":
     raise RuntimeError("Productionda SECRET_KEY ni .env / hosting sozlamasiga yozing!")
@@ -104,6 +118,9 @@ STORAGES = {
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# Katta ma'lumotlar (rasm va h.k.) uchun: standart 2.5 MB, endi 15 MB
+DATA_UPLOAD_MAX_MEMORY_SIZE = 15 * 1024 * 1024
+
 # ---------- DRF + JWT ----------
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
@@ -116,7 +133,8 @@ REST_FRAMEWORK = {
         "rest_framework.throttling.AnonRateThrottle",
         "rest_framework.throttling.UserRateThrottle",
     ),
-    "DEFAULT_THROTTLE_RATES": {"anon": "60/min", "user": "240/min"},
+    # Frontend /api/version ni tez-tez so'raydi, shuning uchun limit oshirildi
+    "DEFAULT_THROTTLE_RATES": {"anon": "1200/min", "user": "1200/min"},
 }
 
 SIMPLE_JWT = {
@@ -124,8 +142,23 @@ SIMPLE_JWT = {
     "REFRESH_TOKEN_LIFETIME": timedelta(days=30),
 }
 
-# ---------- CORS (Vercel'dagi React shu manzildan so'rov yuboradi) ----------
-CORS_ALLOWED_ORIGINS = env_list("CORS_ALLOWED_ORIGINS", "http://localhost:5173")
-CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", "http://localhost:5173")
+# ---------- Ruxsat etilgan frontend manzillari ----------
+FRONTEND_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://8class.vercel.app",
+    "https://8b.uz",
+    "https://www.8b.uz",
+    "https://8bclass.uz",
+    "https://www.8bclass.uz",
+]
+
+CORS_ALLOWED_ORIGINS = merge(FRONTEND_ORIGINS, env_list("CORS_ALLOWED_ORIGINS"))
+CSRF_TRUSTED_ORIGINS = merge(
+    FRONTEND_ORIGINS,
+    ["https://school-backend-lecj.onrender.com"],
+    env_list("CSRF_TRUSTED_ORIGINS"),
+)
+
 # ---------- Productionda (Render) ----------
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
