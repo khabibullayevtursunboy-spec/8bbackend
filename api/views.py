@@ -1,6 +1,6 @@
 import time
 from datetime import timedelta
-from .models import User, Question, Announcement, GameResult, PromoCode, PromoRedemption, SolvedQuestion
+from .models import User, Question, Announcement, GameResult,  SolvedQuestion
 from django.db import IntegrityError, transaction
 from django.db.models import F, Sum, Count
 from django.shortcuts import get_object_or_404
