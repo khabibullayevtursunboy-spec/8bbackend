@@ -1,10 +1,13 @@
+import time
 from datetime import timedelta
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import F, Sum, Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import (
+    api_view, permission_classes, authentication_classes, throttle_classes,
+)
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
@@ -13,7 +16,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
     User, Question, SolvedQuestion, HistoryEvent, Announcement,
-    GameResult, PromoCode, PromoRedemption,
+    GameResult, PromoCode, PromoRedemption, SyncSection,
 )
 from .serializers import (
     UserSerializer, RegisterSerializer, MeUpdateSerializer,
@@ -23,17 +26,13 @@ from .serializers import (
 
 # ================= SOZLAMALAR (xohlaganingizcha o'zgartiring) =================
 
-# Kunlik bonus: 1-kundan 7-kungacha (coin, xp)
 BONUS_REWARDS = [(10, 10), (15, 15), (20, 20), (25, 25), (30, 30), (40, 40), (60, 60)]
 
-# Test savoliga to'g'ri javob uchun
 QUESTION_COINS = 10
 QUESTION_XP = 12
 
-# Bir kunda o'yin va testlardan olish mumkin bo'lgan eng ko'p coin (bonus kirmaydi)
 DAILY_COIN_CAP = 600
 
-# Bitta natija yuborishda beriladigan eng ko'p mukofot
 GAME_LIMITS = {
     "history_puzzle": {"coins": 110, "xp": 130},
     "memory":         {"coins": 80,  "xp": 100},
@@ -48,7 +47,6 @@ GAME_LIMITS = {
 # ================= YORDAMCHI FUNKSIYALAR =================
 
 def todays_coins(user):
-    """Bugun o'yin va testlardan topilgan coin."""
     today = timezone.localdate()
     total = GameResult.objects.filter(
         user=user, created_at__date=today
@@ -57,7 +55,6 @@ def todays_coins(user):
 
 
 def apply_reward(user, coins, xp):
-    """Coin/XP ni xavfsiz (bir vaqtda kelgan so'rovlarda ham to'g'ri) qo'shadi."""
     User.objects.filter(pk=user.pk).update(
         coins=F("coins") + coins, xp=F("xp") + xp
     )
@@ -65,7 +62,6 @@ def apply_reward(user, coins, xp):
 
 
 def bonus_state(user):
-    """(bugun, olish mumkinmi, qaysi kun) ni qaytaradi."""
     today = timezone.localdate()
     last = user.last_bonus_date
     if last == today:
@@ -77,8 +73,11 @@ def bonus_state(user):
 
 # ================= ENDPOINTLAR =================
 
-@api_view(["GET"])
+# HEAD ham ruxsat: UptimeRobot HEAD yuboradi (aks holda 405 chiqadi)
+@api_view(["GET", "HEAD"])
+@authentication_classes([])
 @permission_classes([AllowAny])
+@throttle_classes([])
 def health(request):
     return Response({"status": "ok", "message": "8-sinf gaming portal API ishlayapti"})
 
@@ -237,9 +236,12 @@ class ResultView(APIView):
         s.is_valid(raise_exception=True)
         data = s.validated_data
 
-        limits = GAME_LIMITS[data["game"]]
-        coins = min(data["coins_earned"], limits["coins"])
-        xp = min(data["xp_earned"], limits["xp"])
+        limits = GAME_LIMITS.get(data["game"])
+        if limits is None:
+            return Response({"detail": "Noma'lum o'yin turi."}, status=400)
+
+        coins = max(0, min(data["coins_earned"], limits["coins"]))
+        xp = max(0, min(data["xp_earned"], limits["xp"]))
 
         room = max(0, DAILY_COIN_CAP - todays_coins(request.user))
         coins = min(coins, room)
@@ -282,7 +284,6 @@ class BonusStatusView(APIView):
 class BonusClaimView(APIView):
     def post(self, request):
         with transaction.atomic():
-            # select_for_update: tez-tez bosilsa ham bonus faqat 1 marta beriladi
             user = User.objects.select_for_update().get(pk=request.user.pk)
             today, can_claim, day = bonus_state(user)
             if not can_claim:
@@ -354,3 +355,254 @@ class HistoryContentView(APIView):
             "id", "year", "event", "hint", "cat"
         )
         return Response(list(rows))
+
+
+# ================= SINXRONIZATSIYA (server.ts ning o'rniga) =================
+# Frontend /api/data, /api/rooms ... ga so'rov yuboradi, ma'lumot Neon bazasida saqlanadi.
+
+SYNC_META = "_meta"
+SYNC_SECTIONS = [
+    "settings", "questions", "schedule", "teachers", "library", "promos",
+    "announcements", "homework", "quests", "users", "teacher_accounts",
+    "board_rooms",
+]
+PROTECTED_SECTIONS = {"users", "teacher_accounts"}
+
+ROOM_MAX_AGE_MS = 6 * 60 * 60 * 1000
+BACKUP_SLOTS = 10
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def _body(request):
+    data = request.data
+    return data if isinstance(data, dict) else {}
+
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _item_key(item):
+    if isinstance(item, dict):
+        return item.get("id") or item.get("username")
+    return None
+
+
+def _merge_items(old, new, removed=frozenset()):
+    merged = {}
+    for item in list(old if isinstance(old, list) else []) + list(new if isinstance(new, list) else []):
+        k = _item_key(item)
+        if k is not None:
+            merged[k] = item
+    result = []
+    for item in merged.values():
+        if item.get("id") in removed or item.get("username") in removed:
+            continue
+        result.append(item)
+    return result
+
+
+def _room_key(room):
+    if isinstance(room, dict):
+        for f in ("id", "code", "roomId", "roomCode"):
+            if room.get(f):
+                return str(room[f])
+    return None
+
+
+def _room_time(room):
+    for f in ("updatedAt", "lastUpdated", "lastActivity", "updated", "createdAt"):
+        n = _num(room.get(f))
+        if n is not None:
+            return n
+    return None
+
+
+def _merge_rooms(old, new):
+    merged = {}
+    for room in list(old if isinstance(old, list) else []) + list(new if isinstance(new, list) else []):
+        k = _room_key(room)
+        if k is None:
+            continue
+        prev = merged.get(k)
+        if prev is not None:
+            t_old, t_new = _room_time(prev), _room_time(room)
+            if t_old is not None and t_new is not None and t_new < t_old:
+                continue
+        merged[k] = room
+
+    now = _now_ms()
+    result = []
+    for room in merged.values():
+        t = _room_time(room)
+        if t is not None and t > 1e11 and now - t > ROOM_MAX_AGE_MS:
+            continue
+        result.append(room)
+    return result
+
+
+def _read_db():
+    db = {}
+    for row in SyncSection.objects.all():
+        if row.key == SYNC_META:
+            db["version"] = row.data.get("version", 1)
+            db["lastUpdated"] = row.data.get("lastUpdated", _now_ms())
+        elif row.key.startswith("_"):
+            continue
+        else:
+            db[row.key] = row.data
+    db.setdefault("version", 1)
+    db.setdefault("lastUpdated", _now_ms())
+    return db
+
+
+def _bump():
+    """Faqat transaction.atomic() ichida chaqiring."""
+    for attempt in range(3):
+        try:
+            with transaction.atomic():
+                meta, _ = SyncSection.objects.select_for_update().get_or_create(
+                    key=SYNC_META,
+                    defaults={"data": {"version": 1, "lastUpdated": _now_ms()}},
+                )
+                meta.data = {
+                    "version": meta.data.get("version", 1) + 1,
+                    "lastUpdated": _now_ms(),
+                }
+                meta.save()
+                return meta.data
+        except IntegrityError:
+            if attempt == 2:
+                raise
+
+
+def _set_section(key, data):
+    for attempt in range(3):
+        try:
+            with transaction.atomic():
+                SyncSection.objects.update_or_create(key=key, defaults={"data": data})
+                return
+        except IntegrityError:
+            if attempt == 2:
+                raise
+
+
+@api_view(["GET", "HEAD"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([])
+def sync_version(request):
+    meta = SyncSection.objects.filter(key=SYNC_META).first()
+    if meta:
+        version = meta.data.get("version", 1)
+        last = meta.data.get("lastUpdated", _now_ms())
+    else:
+        version, last = 1, _now_ms()
+    return Response({"version": version, "lastUpdated": last})
+
+
+@api_view(["GET", "HEAD"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([])
+def sync_data(request):
+    return Response(_read_db())
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([])
+def sync_update(request):
+    body = _body(request)
+    section = body.get("section")
+    if section not in SYNC_SECTIONS:
+        return Response({"error": "Invalid section"}, status=400)
+    data = body.get("data")
+    if data is None:
+        return Response({"error": "data kerak"}, status=400)
+    removed = {str(x) for x in (body.get("removed") or [])}
+
+    if section in PROTECTED_SECTIONS and not isinstance(data, list):
+        return Response({"error": "List kerak"}, status=400)
+
+    with transaction.atomic():
+        meta = _bump()
+
+        if section in PROTECTED_SECTIONS:
+            existing = SyncSection.objects.filter(key=section).first()
+            old = existing.data if existing else []
+            if old:
+                _set_section(f"_backup_{section}_{meta['version'] % BACKUP_SLOTS}", old)
+            data = _merge_items(old, data, removed)
+
+        _set_section(section, data)
+
+    result = {"success": True, "section": section, **meta}
+    if section in PROTECTED_SECTIONS:
+        result["data"] = data
+    return Response(result)
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([])
+def sync_initial(request):
+    payload = _body(request)
+    with transaction.atomic():
+        changed = False
+        existing = {r.key: r.data for r in SyncSection.objects.all()}
+        for s in SYNC_SECTIONS:
+            incoming = payload.get(s)
+            if not incoming:
+                continue
+            if s in PROTECTED_SECTIONS and isinstance(incoming, list):
+                merged = _merge_items(existing.get(s) or [], incoming)
+                if merged != (existing.get(s) or []):
+                    _set_section(s, merged)
+                    changed = True
+            elif not existing.get(s):
+                _set_section(s, incoming)
+                changed = True
+        if changed:
+            _bump()
+    db = _read_db()
+    return Response({"success": True, "version": db["version"], "data": db})
+
+
+@api_view(["GET", "HEAD"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([])
+def rooms_get(request):
+    row = SyncSection.objects.filter(key="rooms").first()
+    rooms = _merge_rooms(row.data if row else [], [])
+    return Response({"rooms": rooms})
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([AllowAny])
+@throttle_classes([])
+def rooms_sync(request):
+    body = _body(request)
+    rooms = body.get("rooms")
+    if not isinstance(rooms, list):
+        return Response({"error": "Rooms must be array"}, status=400)
+    removed = {str(x) for x in (body.get("removed") or [])}
+
+    with transaction.atomic():
+        meta = _bump()
+        row = SyncSection.objects.filter(key="rooms").first()
+        merged = _merge_rooms(row.data if row else [], rooms)
+        if removed:
+            merged = [r for r in merged if _room_key(r) not in removed]
+        _set_section("rooms", merged)
+    return Response({"success": True, "count": len(merged), "rooms": merged, **meta})
