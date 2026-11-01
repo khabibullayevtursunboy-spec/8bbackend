@@ -98,3 +98,13 @@ class SyncSection(models.Model):
 
     def __str__(self):
         return self.key
+
+
+class SolvedQuestion(models.Model):
+    """Foydalanuvchi to'g'ri yechgan savollar (qayta chiqmaydi)."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="solved_questions")
+    question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name="solved_by")
+    solved_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("user", "question")

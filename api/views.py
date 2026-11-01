@@ -1,6 +1,6 @@
 import time
 from datetime import timedelta
-
+from .models import User, Question, Announcement, GameResult, PromoCode, PromoRedemption, SolvedQuestion
 from django.db import IntegrityError, transaction
 from django.db.models import F, Sum, Count
 from django.shortcuts import get_object_or_404
@@ -158,48 +158,65 @@ class SubjectListView(APIView):
 
 
 class QuestionListView(APIView):
-    """GET /api/questions/?subject=Matematika&count=10"""
+    """GET /api/questions/?subject=Matematika&count=10
+    Faqat foydalanuvchi hali to'g'ri yechmagan savollarni qaytaradi."""
 
     def get(self, request):
-        qs = Question.objects.filter(is_active=True)
+        base = Question.objects.filter(is_active=True)
         subject = request.query_params.get("subject")
         if subject:
-            qs = qs.filter(subject=subject)
+            base = base.filter(subject=subject)
+
+        total = base.count()
+        remaining = base.exclude(solved_by__user=request.user)
         try:
             count = int(request.query_params.get("count", 10))
         except ValueError:
             count = 10
         count = max(1, min(count, 30))
-        return Response(QuestionPublicSerializer(qs.order_by("?")[:count], many=True).data)
+
+        questions = list(remaining.order_by("?")[:count])
+        return Response(
+            {
+                "total": total,
+                "solved": total - remaining.count(),
+                "all_done": total > 0 and len(questions) == 0,
+                "questions": QuestionPublicSerializer(questions, many=True).data,
+            }
+        )
 
 
 class AnswerView(APIView):
-    """Javobni SERVER tekshiradi va coin/XP ni server beradi."""
+    """Javobni SERVER tekshiradi. Mukofot har savol uchun faqat bir marta beriladi."""
 
     def post(self, request):
         s = AnswerSerializer(data=request.data)
         s.is_valid(raise_exception=True)
 
         question = get_object_or_404(Question, pk=s.validated_data["question_id"], is_active=True)
-        selected = s.validated_data["selected_index"]
-        correct = selected == question.correct_index
+        correct = s.validated_data["selected_index"] == question.correct_index
 
         coins = xp = 0
         cap_reached = False
 
         if correct:
             room = max(0, DAILY_COIN_CAP - todays_coins(request.user))
-            coins = min(QUESTION_COINS, room)
-            xp = QUESTION_XP if coins > 0 else 0
-            cap_reached = coins < QUESTION_COINS
-
-            if coins > 0 or xp > 0:
+            if room == 0:
+                cap_reached = True  # savol yechilgan deb belgilanmaydi, ertaga qayta chiqadi
+            else:
                 with transaction.atomic():
-                    GameResult.objects.create(
-                        user=request.user, game="tests", score=1,
-                        coins_earned=coins, xp_earned=xp,
+                    _, created = SolvedQuestion.objects.get_or_create(
+                        user=request.user, question=question
                     )
-                    apply_reward(request.user, coins, xp)
+                    if created:
+                        coins = min(QUESTION_COINS, room)
+                        xp = QUESTION_XP
+                        cap_reached = coins < QUESTION_COINS
+                        GameResult.objects.create(
+                            user=request.user, game="tests", score=1,
+                            coins_earned=coins, xp_earned=xp,
+                        )
+                        apply_reward(request.user, coins, xp)
 
         return Response(
             {
