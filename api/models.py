@@ -20,7 +20,7 @@ class User(AbstractUser):
 
     @property
     def level(self):
-        # Vaqtinchalik formula: har 100 XP = 1 daraja. Keyin sizning formulangizga moslaymiz.
+        # Vaqtinchalik formula: har 100 XP = 1 daraja
         return self.xp // 100 + 1
 
     def __str__(self):
@@ -28,19 +28,64 @@ class User(AbstractUser):
 
 
 class Question(models.Model):
-    """Fan testi savoli."""
+    """Fan testi savoli (admin panelda A/B/C/D maydonlari orqali qo'shiladi)."""
     subject = models.CharField("Fan", max_length=60)
     text = models.TextField("Savol")
-    options = models.JSONField("Variantlar", default=list)  # ["A variant", "B variant", ...]
+    options = models.JSONField("Variantlar", default=list)
     correct_index = models.PositiveSmallIntegerField("To'g'ri javob raqami (0 dan)")
     explanation = models.TextField("Izoh", blank=True)
-    is_active = models.BooleanField(default=True)
+    is_active = models.BooleanField("Faol", default=True)
 
     class Meta:
         ordering = ["subject", "id"]
+        verbose_name = "Test savoli"
+        verbose_name_plural = "Test savollari"
 
     def __str__(self):
         return f"[{self.subject}] {self.text[:50]}"
+
+
+class SolvedQuestion(models.Model):
+    """Foydalanuvchi to'g'ri yechgan savollar (qayta chiqmaydi)."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="solved_questions")
+    question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name="solved_by")
+    solved_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("user", "question")
+
+
+class HistoryEvent(models.Model):
+    """Tarix Puzzle o'yini uchun voqea (yil + voqea + yordam matni)."""
+
+    class Category(models.TextChoices):
+        UZ = "uz", "O'zbekiston tarixi"
+        WORLD = "world", "Jahon tarixi"
+
+    year = models.IntegerField("Yil")
+    event = models.CharField(
+        "Voqea nomi", max_length=160,
+        help_text="Kartada ko'rinadi. Masalan: Ankara jangi",
+    )
+    hint = models.TextField(
+        "Yordam matni",
+        help_text=(
+            "«Yordam» bosilganda tepada «1402-yilda ...» deb chiqadi. "
+            "Shuning uchun yilni yozmang, gapni davom ettiring. "
+            "Masalan: Amir Temur Usmonli sultoni Boyazid I ni mag'lub etgan."
+        ),
+    )
+    cat = models.CharField("Mavzu", max_length=10, choices=Category.choices, default=Category.UZ)
+    is_active = models.BooleanField("Faol", default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["year"]
+        verbose_name = "Tarix voqeasi"
+        verbose_name_plural = "Tarix voqealari"
+
+    def __str__(self):
+        return f"{self.year} - {self.event}"
 
 
 class Announcement(models.Model):
@@ -91,20 +136,32 @@ class GameResult(models.Model):
     def __str__(self):
         return f"{self.user} - {self.game} ({self.score})"
 
-class SyncSection(models.Model):
-    key = models.CharField(max_length=64, unique=True)
-    data = models.JSONField(default=dict)
-    updated_at = models.DateTimeField(auto_now=True)
 
-    def __str__(self):
-        return self.key
-
-
-class SolvedQuestion(models.Model):
-    """Foydalanuvchi to'g'ri yechgan savollar (qayta chiqmaydi)."""
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="solved_questions")
-    question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name="solved_by")
-    solved_at = models.DateTimeField(auto_now_add=True)
+class PromoCode(models.Model):
+    code = models.CharField(max_length=40, unique=True)
+    coins = models.PositiveIntegerField(default=0)
+    xp = models.PositiveIntegerField(default=0)
+    max_uses = models.PositiveIntegerField(default=0, help_text="0 = cheksiz")
+    expires_at = models.DateTimeField(null=True, blank=True, help_text="Bo'sh = muddatsiz")
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = ("user", "question")
+        ordering = ["-created_at"]
+
+    def save(self, *args, **kwargs):
+        self.code = self.code.strip().upper()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.code
+
+
+class PromoRedemption(models.Model):
+    """Kim qaysi kodni ishlatgan (bir kodni bir kishi faqat bir marta)."""
+    promo = models.ForeignKey(PromoCode, on_delete=models.CASCADE, related_name="redemptions")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="promo_redemptions")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("promo", "user")
