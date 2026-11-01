@@ -5,7 +5,9 @@ from django.db import transaction
 from django.db.models import F, Sum, Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework.decorators import api_view, permission_classes, authentication_classes
+from rest_framework.decorators import (
+    api_view, permission_classes, authentication_classes, throttle_classes,
+)
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -295,10 +297,81 @@ SYNC_SECTIONS = [
     "announcements", "homework", "quests", "users", "teacher_accounts",
     "board_rooms",
 ]
+# Bu bo'limlar almashtirilmaydi, birlashtiriladi (akkauntlar yo'qolmasligi uchun)
+PROTECTED_SECTIONS = {"users", "teacher_accounts"}
+
+ROOM_MAX_AGE_MS = 6 * 60 * 60 * 1000  # 6 soatdan eski xonalar tozalanadi
 
 
 def _now_ms():
     return int(time.time() * 1000)
+
+
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _item_key(item):
+    if isinstance(item, dict):
+        return item.get("id") or item.get("username")
+    return None
+
+
+def _merge_items(old, new):
+    """Eski va yangi ro'yxatni birlashtiradi. Hech bir akkaunt yo'qolmaydi."""
+    if not isinstance(old, list):
+        return new
+    merged = {}
+    for item in list(old) + list(new):
+        k = _item_key(item)
+        if k is not None:
+            merged[k] = item
+    return list(merged.values())
+
+
+def _room_key(room):
+    if isinstance(room, dict):
+        for f in ("id", "code", "roomId", "roomCode"):
+            if room.get(f):
+                return str(room[f])
+    return None
+
+
+def _room_time(room):
+    for f in ("updatedAt", "lastUpdated", "lastActivity", "updated", "createdAt"):
+        n = _num(room.get(f))
+        if n is not None:
+            return n
+    return None
+
+
+def _merge_rooms(old, new):
+    """Xonalarni id/code bo'yicha birlashtiradi: boshqa qurilma yuborgan
+    ro'yxat sizning xonangizni o'chirib yubormaydi."""
+    merged = {}
+    for room in list(old or []) + list(new or []):
+        k = _room_key(room)
+        if k is None:
+            continue
+        prev = merged.get(k)
+        if prev is not None:
+            t_old, t_new = _room_time(prev), _room_time(room)
+            # yangiroq (yoki vaqti noma'lum bo'lsa, kelgan) versiya yutadi
+            if t_old is not None and t_new is not None and t_new < t_old:
+                continue
+        merged[k] = room
+
+    now = _now_ms()
+    result = []
+    for room in merged.values():
+        t = _room_time(room)
+        if t is not None and t > 1e11 and now - t > ROOM_MAX_AGE_MS:
+            continue  # eskirgan xona
+        result.append(room)
+    return result
 
 
 def _read_db():
@@ -307,6 +380,8 @@ def _read_db():
         if row.key == SYNC_META:
             db["version"] = row.data.get("version", 1)
             db["lastUpdated"] = row.data.get("lastUpdated", _now_ms())
+        elif row.key.startswith("_"):
+            continue  # zaxira nusxalar mijozga ketmaydi
         else:
             db[row.key] = row.data
     db.setdefault("version", 1)
@@ -327,6 +402,7 @@ def _bump():
 @api_view(["GET"])
 @authentication_classes([])
 @permission_classes([AllowAny])
+@throttle_classes([])
 def sync_version(request):
     db = _read_db()
     return Response({"version": db["version"], "lastUpdated": db["lastUpdated"]})
@@ -335,6 +411,7 @@ def sync_version(request):
 @api_view(["GET"])
 @authentication_classes([])
 @permission_classes([AllowAny])
+@throttle_classes([])
 def sync_data(request):
     return Response(_read_db())
 
@@ -342,6 +419,7 @@ def sync_data(request):
 @api_view(["POST"])
 @authentication_classes([])
 @permission_classes([AllowAny])
+@throttle_classes([])
 def sync_update(request):
     section = request.data.get("section")
     if section not in SYNC_SECTIONS:
@@ -349,15 +427,32 @@ def sync_update(request):
     data = request.data.get("data")
     if data is None:
         data = []
+
     with transaction.atomic():
+        existing = SyncSection.objects.select_for_update().filter(key=section).first()
+
+        if section in PROTECTED_SECTIONS:
+            if not isinstance(data, list):
+                return Response({"error": "List kerak"}, status=400)
+            if existing and existing.data:
+                SyncSection.objects.update_or_create(
+                    key=f"_backup_{section}", defaults={"data": existing.data}
+                )
+                data = _merge_items(existing.data, data)
+
         SyncSection.objects.update_or_create(key=section, defaults={"data": data})
         meta = _bump()
-    return Response({"success": True, "section": section, **meta})
+
+    result = {"success": True, "section": section, **meta}
+    if section in PROTECTED_SECTIONS:
+        result["data"] = data  # mijoz birlashgan to'liq ro'yxatni oladi
+    return Response(result)
 
 
 @api_view(["POST"])
 @authentication_classes([])
 @permission_classes([AllowAny])
+@throttle_classes([])
 def sync_initial(request):
     payload = request.data if isinstance(request.data, dict) else {}
     with transaction.atomic():
@@ -376,19 +471,29 @@ def sync_initial(request):
 @api_view(["GET"])
 @authentication_classes([])
 @permission_classes([AllowAny])
+@throttle_classes([])
 def rooms_get(request):
     row = SyncSection.objects.filter(key="rooms").first()
-    return Response({"rooms": row.data if row else []})
+    rooms = _merge_rooms(row.data if row else [], [])
+    return Response({"rooms": rooms})
 
 
 @api_view(["POST"])
 @authentication_classes([])
 @permission_classes([AllowAny])
+@throttle_classes([])
 def rooms_sync(request):
     rooms = request.data.get("rooms")
     if not isinstance(rooms, list):
         return Response({"error": "Rooms must be array"}, status=400)
+    # Ixtiyoriy: frontend o'chirilgan xonalar id/code ro'yxatini yuborsa
+    removed = {str(x) for x in (request.data.get("removed") or [])}
+
     with transaction.atomic():
-        SyncSection.objects.update_or_create(key="rooms", defaults={"data": rooms})
+        row = SyncSection.objects.select_for_update().filter(key="rooms").first()
+        merged = _merge_rooms(row.data if row else [], rooms)
+        if removed:
+            merged = [r for r in merged if _room_key(r) not in removed]
+        SyncSection.objects.update_or_create(key="rooms", defaults={"data": merged})
         _bump()
-    return Response({"success": True, "count": len(rooms)})
+    return Response({"success": True, "count": len(merged), "rooms": merged})
