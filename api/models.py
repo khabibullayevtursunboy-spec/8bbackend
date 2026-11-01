@@ -165,3 +165,8 @@ class PromoRedemption(models.Model):
 
     class Meta:
         unique_together = ("promo", "user")
+
+class SyncSection(models.Model):
+    key = models.CharField(max_length=64, unique=True)
+    data = models.JSONField(default=dict)
+    updated_at = models.DateTimeField(auto_now=True)
