@@ -1,7 +1,7 @@
 import time
 from datetime import timedelta
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import F, Sum, Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -76,8 +76,11 @@ def bonus_state(user):
 
 # ================= ENDPOINTLAR =================
 
-@api_view(["GET"])
+# HEAD ham ruxsat: UptimeRobot kabi monitorlar HEAD yuboradi (aks holda 405 chiqadi)
+@api_view(["GET", "HEAD"])
+@authentication_classes([])
 @permission_classes([AllowAny])
+@throttle_classes([])
 def health(request):
     return Response({"status": "ok", "message": "8-sinf gaming portal API ishlayapti"})
 
@@ -219,9 +222,13 @@ class ResultView(APIView):
         s.is_valid(raise_exception=True)
         data = s.validated_data
 
-        limits = GAME_LIMITS[data["game"]]
-        coins = min(data["coins_earned"], limits["coins"])
-        xp = min(data["xp_earned"], limits["xp"])
+        # Noma'lum o'yin nomi kelsa, 500 emas, tushunarli 400 qaytadi
+        limits = GAME_LIMITS.get(data["game"])
+        if limits is None:
+            return Response({"detail": "Noma'lum o'yin turi."}, status=400)
+
+        coins = max(0, min(data["coins_earned"], limits["coins"]))
+        xp = max(0, min(data["xp_earned"], limits["xp"]))
 
         room = max(0, DAILY_COIN_CAP - todays_coins(request.user))
         coins = min(coins, room)
@@ -301,10 +308,17 @@ SYNC_SECTIONS = [
 PROTECTED_SECTIONS = {"users", "teacher_accounts"}
 
 ROOM_MAX_AGE_MS = 6 * 60 * 60 * 1000  # 6 soatdan eski xonalar tozalanadi
+BACKUP_SLOTS = 10                      # oxirgi 10 ta zaxira nusxa aylanma saqlanadi
 
 
 def _now_ms():
     return int(time.time() * 1000)
+
+
+def _body(request):
+    """So'rov tanasi har doim dict bo'lsin (ro'yxat yoki bo'sh kelsa ham xato bermaydi)."""
+    data = request.data
+    return data if isinstance(data, dict) else {}
 
 
 def _num(v):
@@ -320,16 +334,20 @@ def _item_key(item):
     return None
 
 
-def _merge_items(old, new):
-    """Eski va yangi ro'yxatni birlashtiradi. Hech bir akkaunt yo'qolmaydi."""
-    if not isinstance(old, list):
-        return new
+def _merge_items(old, new, removed=frozenset()):
+    """Eski va yangi ro'yxatni birlashtiradi. Hech bir akkaunt o'zi yo'qolmaydi.
+    Faqat `removed` da aniq ko'rsatilgan id/username o'chiriladi."""
     merged = {}
-    for item in list(old) + list(new):
+    for item in list(old if isinstance(old, list) else []) + list(new if isinstance(new, list) else []):
         k = _item_key(item)
         if k is not None:
             merged[k] = item
-    return list(merged.values())
+    result = []
+    for item in merged.values():
+        if item.get("id") in removed or item.get("username") in removed:
+            continue
+        result.append(item)
+    return result
 
 
 def _room_key(room):
@@ -352,7 +370,7 @@ def _merge_rooms(old, new):
     """Xonalarni id/code bo'yicha birlashtiradi: boshqa qurilma yuborgan
     ro'yxat sizning xonangizni o'chirib yubormaydi."""
     merged = {}
-    for room in list(old or []) + list(new or []):
+    for room in list(old if isinstance(old, list) else []) + list(new if isinstance(new, list) else []):
         k = _room_key(room)
         if k is None:
             continue
@@ -390,25 +408,54 @@ def _read_db():
 
 
 def _bump():
-    """Faqat transaction.atomic() ichida chaqiring."""
-    meta, _ = SyncSection.objects.select_for_update().get_or_create(
-        key=SYNC_META, defaults={"data": {"version": 1, "lastUpdated": _now_ms()}}
-    )
-    meta.data = {"version": meta.data.get("version", 1) + 1, "lastUpdated": _now_ms()}
-    meta.save()
-    return meta.data
+    """Versiyani oshiradi. Faqat transaction.atomic() ichida chaqiring.
+    Meta qator qulflanadi, shuning uchun bir vaqtdagi yozuvlar navbat bilan bajariladi."""
+    for attempt in range(3):
+        try:
+            with transaction.atomic():
+                meta, _ = SyncSection.objects.select_for_update().get_or_create(
+                    key=SYNC_META,
+                    defaults={"data": {"version": 1, "lastUpdated": _now_ms()}},
+                )
+                meta.data = {
+                    "version": meta.data.get("version", 1) + 1,
+                    "lastUpdated": _now_ms(),
+                }
+                meta.save()
+                return meta.data
+        except IntegrityError:
+            # ikki so'rov bir vaqtda birinchi qatorni yaratmoqchi bo'ldi: qayta urinamiz
+            if attempt == 2:
+                raise
 
 
-@api_view(["GET"])
+def _set_section(key, data):
+    """Bo'limni saqlaydi (ikki so'rov bir vaqtda yaratsa ham xato bermaydi)."""
+    for attempt in range(3):
+        try:
+            with transaction.atomic():
+                SyncSection.objects.update_or_create(key=key, defaults={"data": data})
+                return
+        except IntegrityError:
+            if attempt == 2:
+                raise
+
+
+@api_view(["GET", "HEAD"])
 @authentication_classes([])
 @permission_classes([AllowAny])
 @throttle_classes([])
 def sync_version(request):
-    db = _read_db()
-    return Response({"version": db["version"], "lastUpdated": db["lastUpdated"]})
+    meta = SyncSection.objects.filter(key=SYNC_META).first()
+    if meta:
+        version = meta.data.get("version", 1)
+        last = meta.data.get("lastUpdated", _now_ms())
+    else:
+        version, last = 1, _now_ms()
+    return Response({"version": version, "lastUpdated": last})
 
 
-@api_view(["GET"])
+@api_view(["GET", "HEAD"])
 @authentication_classes([])
 @permission_classes([AllowAny])
 @throttle_classes([])
@@ -421,27 +468,30 @@ def sync_data(request):
 @permission_classes([AllowAny])
 @throttle_classes([])
 def sync_update(request):
-    section = request.data.get("section")
+    body = _body(request)
+    section = body.get("section")
     if section not in SYNC_SECTIONS:
         return Response({"error": "Invalid section"}, status=400)
-    data = request.data.get("data")
+    data = body.get("data")
     if data is None:
-        data = []
+        return Response({"error": "data kerak"}, status=400)
+    removed = {str(x) for x in (body.get("removed") or [])}
 
     with transaction.atomic():
-        existing = SyncSection.objects.select_for_update().filter(key=section).first()
+        # Avval meta qatorni qulflaymiz: bir vaqtdagi yozuvlar bir-birining ustiga yozmaydi
+        meta = _bump()
 
         if section in PROTECTED_SECTIONS:
             if not isinstance(data, list):
                 return Response({"error": "List kerak"}, status=400)
-            if existing and existing.data:
-                SyncSection.objects.update_or_create(
-                    key=f"_backup_{section}", defaults={"data": existing.data}
-                )
-                data = _merge_items(existing.data, data)
+            existing = SyncSection.objects.filter(key=section).first()
+            old = existing.data if existing else []
+            if old:
+                # aylanma zaxira nusxa (oxirgi 10 tasi saqlanadi)
+                _set_section(f"_backup_{section}_{meta['version'] % BACKUP_SLOTS}", old)
+            data = _merge_items(old, data, removed)
 
-        SyncSection.objects.update_or_create(key=section, defaults={"data": data})
-        meta = _bump()
+        _set_section(section, data)
 
     result = {"success": True, "section": section, **meta}
     if section in PROTECTED_SECTIONS:
@@ -454,21 +504,30 @@ def sync_update(request):
 @permission_classes([AllowAny])
 @throttle_classes([])
 def sync_initial(request):
-    payload = request.data if isinstance(request.data, dict) else {}
+    payload = _body(request)
     with transaction.atomic():
+        _bump_needed = False
         existing = {r.key: r.data for r in SyncSection.objects.all()}
-        modified = False
         for s in SYNC_SECTIONS:
-            if not existing.get(s) and payload.get(s):
-                SyncSection.objects.update_or_create(key=s, defaults={"data": payload[s]})
-                modified = True
-        if modified:
+            incoming = payload.get(s)
+            if not incoming:
+                continue
+            if s in PROTECTED_SECTIONS and isinstance(incoming, list):
+                # brauzerda qolgan akkauntlar ham serverga qo'shiladi, mavjudlari o'chmaydi
+                merged = _merge_items(existing.get(s) or [], incoming)
+                if merged != (existing.get(s) or []):
+                    _set_section(s, merged)
+                    _bump_needed = True
+            elif not existing.get(s):
+                _set_section(s, incoming)
+                _bump_needed = True
+        if _bump_needed:
             _bump()
     db = _read_db()
     return Response({"success": True, "version": db["version"], "data": db})
 
 
-@api_view(["GET"])
+@api_view(["GET", "HEAD"])
 @authentication_classes([])
 @permission_classes([AllowAny])
 @throttle_classes([])
@@ -483,17 +542,18 @@ def rooms_get(request):
 @permission_classes([AllowAny])
 @throttle_classes([])
 def rooms_sync(request):
-    rooms = request.data.get("rooms")
+    body = _body(request)
+    rooms = body.get("rooms")
     if not isinstance(rooms, list):
         return Response({"error": "Rooms must be array"}, status=400)
     # Ixtiyoriy: frontend o'chirilgan xonalar id/code ro'yxatini yuborsa
-    removed = {str(x) for x in (request.data.get("removed") or [])}
+    removed = {str(x) for x in (body.get("removed") or [])}
 
     with transaction.atomic():
-        row = SyncSection.objects.select_for_update().filter(key="rooms").first()
+        meta = _bump()  # meta qatorni qulflaydi: xonalar bir-birini bosib ketmaydi
+        row = SyncSection.objects.filter(key="rooms").first()
         merged = _merge_rooms(row.data if row else [], rooms)
         if removed:
             merged = [r for r in merged if _room_key(r) not in removed]
-        SyncSection.objects.update_or_create(key="rooms", defaults={"data": merged})
-        _bump()
-    return Response({"success": True, "count": len(merged), "rooms": merged})
+        _set_section("rooms", merged)
+    return Response({"success": True, "count": len(merged), "rooms": merged, **meta})
